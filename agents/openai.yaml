@@ -1,0 +1,3 @@
+display_name: Codex WebSocket Image Cleaner
+short_description: Fixes Codex reconnecting and WebSocket-like failures caused by image-bloated rollout sessions, with backup and restore support.
+default_prompt: Diagnose the specified Codex thread for image payload bloat first. If applying cleanup, back up the rollout, remove embedded image payloads, validate JSONL, and provide restore instructions.
