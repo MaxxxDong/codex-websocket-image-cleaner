@@ -75,10 +75,14 @@ X/Twitter 上更多是性能和稳定性讨论，可复现细节不如 GitHub is
 - 移除 message 里的 `input_image`
 - 清理残留的 `<image>` 文本 wrapper
 - 清空 event 里的 images 数组
+- 对所有 `type: "compacted"` 行逐字节原样保留
 - 校验每一行都是合法 JSON
-- 校验没有残留图片标记后才覆盖原文件
+- 校验普通记录中没有真实图片 payload 后才覆盖原文件
+- 校验 compact 行的有序 SHA-256 完全不变
 
 原始备份不会被清理命令删除。
+
+`compacted` 是 Codex 重启后恢复上下文的内部检查点，不是普通历史记录。它可能仍包含图片标记和图片字节；工具会报告这些保留内容，但不会修改。直接递归清理 `compacted.payload.replacement_history` 会让重启 hydration 回退到完整历史，并可能触发 `context_window_exceeded`。
 
 ## 它不做什么
 
@@ -125,7 +129,7 @@ python scripts/imageclean.py --path C:\Users\you\.codex\sessions\2026\05\21\roll
 ## 安装为 Codex Skill
 
 ```powershell
-git clone https://github.com/<owner>/codex-websocket-image-cleaner.git
+git clone https://github.com/MaxxxDong/codex-websocket-image-cleaner.git
 Copy-Item -Recurse .\codex-websocket-image-cleaner "$env:USERPROFILE\.codex\skills\codex-websocket-image-cleaner"
 ```
 
@@ -170,7 +174,12 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<user>\Documents\Codex\codex-b
 
 - 旧聊天里的可视图片内容会被移除，文字历史会保留。
 - 如果需要在旧 thread 里继续查看那些图片，请先导出或归档。
-- 某些嵌套历史 payload 可能需要递归 JSON 清理。
+- 普通记录中的嵌套图片 payload 会按 JSON 结构递归清理；compact 检查点永远不递归改写。
 - 继续在同一个 thread 里处理图片，后面还可能再次膨胀。
 - 工具依赖当前 Codex rollout JSONL 格式；Codex 格式变化后需要重新验证。
 - 清理后先保留备份，确认 thread 正常后再考虑删除。
+- 因为 compact 检查点必须保留，安全清理后的文件可能仍明显大于理论上的“全 marker 归零”大小。
+
+## 当前版本
+
+**v1.1.0**，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
