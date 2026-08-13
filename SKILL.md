@@ -26,9 +26,11 @@ Read `README.md` for user-facing documentation and `README.zh-CN.md` for the Chi
 - Treat `~/.codex` and `%USERPROFILE%` as protected paths.
 - Back up the rollout before applying changes.
 - Never delete the original backup.
-- Do not truncate event history, reorder lines, or edit SQLite records.
+- Do not truncate event history, reorder lines, edit SQLite records, or rewrite any `type: "compacted"` line.
+- Treat compacted lines as opaque hydration checkpoints. Copy them byte-for-byte and verify their ordered SHA-256 hashes before replacing the rollout.
 - Prefer removing image payloads over replacing them with tiny image data URLs; tiny images can still trigger model-side image validation errors.
-- After any apply, validate every JSONL line and assert there are no remaining `data:image/`, `input_image`, or `image_url` markers.
+- Remove actual active payloads structurally. Do not replace ordinary text merely because it mentions `input_image` or `image_url`.
+- After any apply, validate every JSONL line, assert no active image payloads remain outside compacted lines, and assert every compacted-line hash is unchanged.
 
 ## Workflow
 
@@ -56,7 +58,9 @@ python scripts/imageclean.py --thread 019e356a-cf17-7b11-aab5-88e6e3988a51 --app
    - number of removed message `input_image` items
    - backup directory
    - restore script path
-   - final marker counts
+   - active payload counts
+   - number and bytes of compacted lines preserved
+   - compacted-line hash verification
 
 5. Ask the user to restart Codex App and test the repaired thread if the App had the thread open.
 
@@ -71,8 +75,16 @@ The bundled script:
 - removes `input_image` items from message content lists
 - removes `<image>` / `</image>` wrapper text left beside removed images
 - clears event `images` arrays
+- preserves every compacted line byte-for-byte, including any historical image bytes inside it
 - validates the rewritten JSONL
-- verifies no image markers remain
+- verifies no active image payloads remain outside compacted lines
+- verifies ordered compacted-line hashes are unchanged
+
+Raw marker counts may remain inside preserved compacted checkpoints or harmless text/schema descriptions. This is intentional. A smaller cleanup that preserves hydration semantics is safer than a marker-zero rewrite that invalidates remote compact state.
+
+## Recovery From Older Cleaner Versions
+
+If a cleaned thread works before restart but fails after restart with `context_window_exceeded`, compare it with the backup. If any compacted line changed, restore the backup first, then rerun the current cleaner. Never repair this symptom by recursively scrubbing `compacted.payload.replacement_history`.
 
 ## Restore
 

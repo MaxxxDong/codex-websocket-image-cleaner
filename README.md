@@ -18,6 +18,8 @@ Many users first debug VPN, proxies, TUN mode, DNS, WebSocket fallback, or SSE f
 
 Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 
+Current release: **v1.1.0**. See [CHANGELOG.md](CHANGELOG.md).
+
 ## Why This Matters
 
 Codex stores conversation state in local JSONL rollout files under:
@@ -77,10 +79,14 @@ When applied, it:
 - removes message `input_image` items
 - removes leftover `<image>` wrapper text when present
 - clears event image arrays
+- preserves every `type: "compacted"` line byte-for-byte
 - validates every rewritten JSONL line
-- refuses to replace the original if image markers remain
+- refuses to replace the original if active image payloads remain outside compacted lines
+- verifies the ordered SHA-256 hashes of all compacted lines
 
 The original rollout backup is preserved.
+
+Compacted records are opaque Codex hydration checkpoints, not ordinary transcript lines. They may retain historical image bytes and marker text. The cleaner reports those retained bytes but never rewrites them: changing `compacted.payload.replacement_history` can make restart hydration fall back to full history and trigger `context_window_exceeded`.
 
 ## What It Does Not Do
 
@@ -135,7 +141,7 @@ python scripts/imageclean.py --thread 019e4ae7-0621-7443-9181-8fcddf82995a --bac
 Clone the repository and copy the skill folder into your Codex skills directory:
 
 ```powershell
-git clone https://github.com/<owner>/codex-websocket-image-cleaner.git
+git clone https://github.com/MaxxxDong/codex-websocket-image-cleaner.git
 Copy-Item -Recurse .\codex-websocket-image-cleaner "$env:USERPROFILE\.codex\skills\codex-websocket-image-cleaner"
 ```
 
@@ -178,10 +184,10 @@ Codex rollout files are JSONL: one JSON object per line. The script uses a conse
 1. Resolve the target thread id to a `rollout-*.jsonl` file.
 2. Copy the original file to a backup directory.
 3. Parse each JSONL line with Python `json`.
-4. Rewrite only image-bearing message/tool payloads.
-5. Serialize compact JSONL.
-6. Validate every output line.
-7. Count forbidden image markers.
+4. Copy compacted checkpoint lines byte-for-byte.
+5. Rewrite only active image-bearing message/tool payloads.
+6. Validate every output line and active payload count.
+7. Verify ordered compacted-line SHA-256 hashes.
 8. Replace the original only after validation succeeds.
 
 This keeps the repair local, deterministic, and reversible.
@@ -201,38 +207,43 @@ Use this order before blaming the network:
 
 - The old visual image content is removed from the chat transcript. Text history remains.
 - If you need the exact images visible inside the old thread, export or archive first.
-- Some nested historical payloads can require a recursive JSON-aware cleanup pass.
+- Nested active payloads are cleaned structurally; compacted checkpoints are never recursively rewritten.
 - Codex may append new image payloads later if the thread continues using images.
 - This tool depends on the current Codex rollout JSONL format.
 - Always keep the backup until the repaired thread has been tested.
+- Safe output may remain larger than a theoretical marker-zero rewrite because hydration checkpoints are preserved.
 
 ## Repository Contents
 
 ```text
 codex-websocket-image-cleaner/
+├── CHANGELOG.md
 ├── README.md
 ├── README.zh-CN.md
 ├── SKILL.md
 ├── agents/
 │   └── openai.yaml
-└── scripts/
-    └── imageclean.py
+├── scripts/
+│   └── imageclean.py
+└── tests/
+    └── test_imageclean.py
 ```
 
 ## Status
 
-Current version:
+Current version: **v1.1.0**
 
 - report-only mode
 - backup-first apply mode
 - restore script generation
 - JSONL validation
-- image marker validation
+- active image payload validation
+- byte-exact compacted checkpoint preservation
+- compacted-line hash validation
 - Codex skill metadata
 
 Planned improvements:
 
-- built-in recursive cleanup mode
 - batch report over all Codex sessions
 - size threshold warnings
 - stale `.tmp-imageclean-*` cleanup
