@@ -98,7 +98,7 @@ It does not:
 - configure VPN, DNS, TUN mode, or proxy environment variables
 - summarize old text conversation history
 - delete normal text messages
-- edit SQLite databases
+- edit unrelated SQLite data (only the target thread history byte offsets are rebased)
 - remove generated image files from disk
 - guarantee that a very long text-only thread fits the model context window
 
@@ -248,3 +248,23 @@ Planned improvements:
 - size threshold warnings
 - stale `.tmp-imageclean-*` cleanup
 - optional HTML/Markdown cleanup report
+
+## Close clients before applying or restoring
+
+Before `--apply` or restore, quit Codex Desktop and stop any CLI/app-server using the target thread. Run the cleaner from an external terminal and reopen Codex only after it finishes. An idle thread can still have an open writer.
+
+On macOS/Linux, replacing an open rollout leaves its writer attached to the old inode. Later conversations can disappear after exit. The cleaner now checks open handles with `lsof` before backup and before replacement, and refuses apply when inspection is unavailable or fails. These checks are best effort; keep clients stopped throughout cleanup to avoid a race after the final check.
+
+If history has already disappeared, preserve the current rollout and backups before recovery. Restoring the original backup overwrites newer history and cannot recover conversations written only to an unlinked inode. Recovery through an open handle may be possible while the original writer is still alive; after it exits that route is unavailable.
+
+## Repair stale paginated history after older cleanups
+
+Cleanup now rebases the target thread's cached byte offsets in `thread_history_1.sqlite`, with a database backup. Older cleanups could leave the cursor beyond EOF, hiding later conversations that remain in the rollout.
+
+Quit all Codex clients and app-server processes, then run from an external terminal:
+
+```bash
+python3 scripts/imageclean.py --thread <thread-id> --repair-history-index --apply
+```
+
+This repairs offsets using unchanged record ordinals without rewriting the rollout or deleting items. Keep every client of the history database stopped. After restoring an older rollout, rerun this repair to match its offsets.

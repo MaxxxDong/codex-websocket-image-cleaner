@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Rebase cached paginated history byte offsets after shrinking a rollout, with a history database backup.
+- Add `--repair-history-index --apply` to recover history hidden by older cleanups without rewriting the rollout.
+- Refuse POSIX cleanup when rollout/history files are open or handle inspection fails.
+- Document offline cleanup and repair requirements and add regression tests.
+
 ## v1.1.0 - 2026-08-13
 
 - Preserve every Codex `type: "compacted"` hydration checkpoint byte-for-byte.

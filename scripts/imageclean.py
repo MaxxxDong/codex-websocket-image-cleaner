@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import subprocess
 from typing import Any
 
 
@@ -244,10 +245,120 @@ def write_restore_scripts(backup_dir: Path, backup_path: Path, target: Path) -> 
     return restore_ps1, restore_sh
 
 
-def clean_rollout(path: Path, backup_root: Path, thread_id: str | None) -> dict[str, Any]:
+def assert_rollout_closed(path: Path) -> None:
+    """Reject live POSIX files: rename would orphan an existing writer's inode.
+
+    This is a best-effort check, not a lock respected by Codex. Keep all clients
+    using this thread stopped throughout cleanup, including the final rename.
+    Windows rejects replacing a file held by the normal Codex writer itself.
+    """
+    if os.name == "nt":
+        return
+    lsof = shutil.which("lsof")
+    if not lsof:
+        raise SystemExit("Cannot verify rollout is closed: install lsof before --apply.")
+    try:
+        result = subprocess.run(
+            [lsof, "-nP", "-F", "p", "--", str(path.resolve())],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit("Cannot verify rollout is closed; target was not replaced.") from exc
+    if result.stdout.strip():
+        raise SystemExit(
+            "Rollout is open by a process. Close Codex App and any CLI/app-server "
+            "using this thread, then run --apply from an external terminal. "
+            "Replacing an open rollout can lose future conversations after restart."
+        )
+    if result.returncode != 1 or result.stderr.strip():
+        raise SystemExit("Cannot verify rollout is closed (lsof failed); target was not replaced.")
+
+
+def validate_thread_identity(path: Path, thread_id: str | None) -> str | None:
+    with path.open("r", encoding="utf-8") as source:
+        meta = json.loads(source.readline())
+    payload = meta.get("payload")
+    recorded_id = payload.get("id") if meta.get("type") == "session_meta" and isinstance(payload, dict) else None
+    requested_id = parse_thread_id(thread_id) if thread_id else None
+    if recorded_id and requested_id and recorded_id != requested_id:
+        raise SystemExit("Thread ID does not match rollout session_meta; refusing to modify files.")
+    return requested_id or recorded_id
+
+
+def repair_history_index(path: Path, db: Path, thread_id: str, backup_root: Path) -> dict[str, Any]:
+    """Rebase cached byte offsets using unchanged zero-based rollout ordinals.
+
+    The end ordinal is inclusive; the projection cursor is the next ordinal.
+    Do not discard indexed items or change any other thread's history.
+    """
+    if not db.exists():
+        raise SystemExit(f"History DB not found: {db}")
+    assert_rollout_closed(path)
+    assert_rollout_closed(db)
+    validate_thread_identity(path, thread_id)
+    offsets = [0]
+    with path.open("rb") as source:
+        for line in source:
+            json.loads(line)
+            offsets.append(offsets[-1] + len(line))
+
+    def offset(ordinal: int | None, *, end: bool = False) -> int | None:
+        if ordinal is None:
+            return None
+        index = ordinal + int(end)
+        if index < 0 or index >= len(offsets):
+            raise SystemExit(f"History ordinal {ordinal} is outside rollout; refusing repair.")
+        return offsets[index]
+
+    con = sqlite3.connect(str(db))
+    try:
+        turns = con.execute(
+            "SELECT rowid, rollout_ordinal, rollout_end_ordinal FROM thread_turns WHERE thread_id=?", (thread_id,)
+        ).fetchall()
+        cursor = con.execute(
+            "SELECT next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id=?", (thread_id,)
+        ).fetchone()
+        updates = [(offset(start), offset(end, end=True), rowid) for rowid, start, end in turns]
+        next_offset = offset(cursor[0]) if cursor else None
+        backup_dir = backup_root / ("history-index-repair-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+        backup_dir.mkdir(parents=True, exist_ok=False)
+        backup = backup_dir / db.name
+        with sqlite3.connect(str(backup)) as dest:
+            con.backup(dest)
+        # Clients must remain stopped throughout; the lsof check is not a lock.
+        with con:
+            con.executemany(
+                "UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=? WHERE rowid=?", updates
+            )
+            if cursor:
+                con.execute(
+                    "UPDATE thread_history_projection_state SET next_rollout_byte_offset=? WHERE thread_id=?",
+                    (next_offset, thread_id),
+                )
+    finally:
+        con.close()
+    return {"thread_id": thread_id, "history_backup": str(backup),
+            "turns_rebased": len(updates), "next_rollout_byte_offset": next_offset}
+
+
+def clean_rollout(path: Path, backup_root: Path, thread_id: str | None, history_db: Path | None = None) -> dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"Rollout not found: {path}")
 
+    assert_rollout_closed(path)
+    indexed_thread = validate_thread_identity(path, thread_id)
+    history_db = history_db if history_db is not None else codex_home() / "thread_history_1.sqlite"
+    repair_needed = False
+    if indexed_thread and history_db.exists():
+        con = sqlite3.connect(f"file:{history_db}?mode=ro", uri=True)
+        try:
+            repair_needed = con.execute(
+                "SELECT 1 FROM thread_history_projection_state WHERE thread_id=?", (indexed_thread,)
+            ).fetchone() is not None
+        finally:
+            con.close()
+        if repair_needed:
+            assert_rollout_closed(history_db)
     source_stat = path.stat()
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     slug = thread_id[:8] if thread_id else path.stem[-8:]
@@ -274,8 +385,9 @@ def clean_rollout(path: Path, backup_root: Path, thread_id: str | None) -> dict[
                 output.write(json.dumps(cleaned, ensure_ascii=False, separators=(",", ":")) + line_ending(line))
 
         checked = validate_rollout(tmp, compacted_hashes)
+        assert_rollout_closed(path)
         current_stat = path.stat()
-        if (current_stat.st_size, current_stat.st_mtime_ns) != (source_stat.st_size, source_stat.st_mtime_ns):
+        if (current_stat.st_dev, current_stat.st_ino, current_stat.st_size, current_stat.st_mtime_ns) != (source_stat.st_dev, source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns):
             raise SystemExit("Rollout changed during cleanup; target was not replaced.")
 
         os.chmod(tmp, source_stat.st_mode)
@@ -285,7 +397,23 @@ def clean_rollout(path: Path, backup_root: Path, thread_id: str | None) -> dict[
         tmp.unlink(missing_ok=True)
 
     restore_ps1, restore_sh = write_restore_scripts(backup_dir, backup_path, path)
+    try:
+        history_repair = (
+            repair_history_index(path, history_db, indexed_thread, backup_dir)
+            if repair_needed else None
+        )
+    except (Exception, SystemExit):
+        # Index repair validates before updating and uses a SQLite transaction.
+        # Restore the matching rollout if it cannot complete.
+        assert_rollout_closed(path)
+        try:
+            shutil.copy2(backup_path, tmp)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        raise
     manifest = {
+        "history_index_repair": history_repair,
         "thread_id": thread_id,
         "target": str(path),
         "backup": str(backup_path),
@@ -310,6 +438,8 @@ def main() -> int:
     parser.add_argument("--path", help="Explicit rollout JSONL path")
     parser.add_argument("--state-db", help="Codex state_5.sqlite path")
     parser.add_argument("--backup-root", default=str(Path.home() / "Documents" / "Codex" / "codex-backups"))
+    parser.add_argument("--repair-history-index", action="store_true", help="Offline repair of cached history byte offsets; requires --thread and --apply.")
+    parser.add_argument("--history-db", help="Override thread_history_1.sqlite path")
     parser.add_argument("--apply", action="store_true", help="Apply cleanup. Without this flag, report only.")
     args = parser.parse_args()
 
@@ -317,8 +447,17 @@ def main() -> int:
     rollout_path = rollout_path.expanduser()
     if not rollout_path.exists():
         raise SystemExit(f"Rollout not found: {rollout_path}")
+    if args.repair_history_index:
+        if not args.apply or not thread_id:
+            raise SystemExit("--repair-history-index requires --thread and --apply.")
+        result = repair_history_index(
+            rollout_path, Path(args.history_db).expanduser() if args.history_db else codex_home() / "thread_history_1.sqlite",
+            parse_thread_id(thread_id), Path(args.backup_root).expanduser(),
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     result = (
-        {"mode": "apply", "thread_id": thread_id, "result": clean_rollout(rollout_path, Path(args.backup_root).expanduser(), thread_id)}
+        {"mode": "apply", "thread_id": thread_id, "result": clean_rollout(rollout_path, Path(args.backup_root).expanduser(), thread_id, Path(args.history_db).expanduser() if args.history_db else None)}
         if args.apply
         else {"mode": "report", "thread_id": thread_id, "report": analyze_rollout(rollout_path)}
     )

@@ -94,13 +94,19 @@ X/Twitter 上更多是性能和稳定性讨论，可复现细节不如 GitHub is
 - 配置 VPN、DNS、TUN 或代理环境变量
 - 总结旧文本上下文
 - 删除普通文字对话
-- 修改 SQLite 数据库
+- 修改无关 SQLite 数据（仅重算目标线程历史索引的字节偏移）
 - 删除磁盘上的生成图片文件
 - 保证超长纯文本线程一定能塞进模型上下文
 
 如果一个新开的短线程也一直 reconnect，那更像网络/代理/WebSocket 问题。如果一个纯文本老线程上下文爆了，应该用 `/clear`、`/compact` 或新开 handoff 线程。
 
 ## 使用方式
+
+**执行 `--apply` 前，必须退出使用目标线程的 Codex Desktop、CLI 和 app-server，然后在外部终端运行。清理完成后再打开 Codex。回滚也必须先退出这些进程。**
+
+仅停止生成或切换线程并不保证写入句柄已关闭。在 macOS/Linux 上，替换仍被打开的 rollout 会使后续对话写入旧 inode，退出后这些对话可能丢失。脚本会在备份前和替换前通过 `lsof` 检测打开的文件；缺少 `lsof` 或检测失败时拒绝清理。检测无法消除最后一次检查后的竞争窗口，因此清理期间必须保持客户端关闭。
+
+若已出现重启后历史丢失，先保留现有 rollout 和备份，不要直接运行旧备份的恢复脚本覆盖当前文件。旧备份只包含清理之前的内容，无法恢复之后未落入目标文件的对话。若进程尚未退出，可检查其仍持有的已删除文件；退出后通常无法再通过文件句柄取回。
 
 只报告，不修改：
 
@@ -183,3 +189,15 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<user>\Documents\Codex\codex-b
 ## 当前版本
 
 **v1.1.0**，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 清理后重启只显示旧历史
+
+新版本会同步按记录序号重算 `thread_history_1.sqlite` 的字节偏移，并备份该数据库。旧版仅缩短 rollout，可能使分页历史索引停在旧文件末尾，导致后续对话虽已保存却不显示。
+
+修复已受影响的线程：先退出 Codex 和 app-server，从外部终端执行（不重新清理图片）：
+
+```bash
+python3 scripts/imageclean.py --thread <线程ID> --repair-history-index --apply
+```
+
+此命令备份历史数据库，只重算目标线程的字节偏移，不删除对话或修改 rollout。所有使用该历史数据库的客户端必须保持关闭。恢复旧 rollout 后，也需要再次执行索引修复以匹配其字节位置。
