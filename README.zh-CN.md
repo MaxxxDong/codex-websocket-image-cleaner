@@ -94,13 +94,19 @@ X/Twitter 上更多是性能和稳定性讨论，可复现细节不如 GitHub is
 - 配置 VPN、DNS、TUN 或代理环境变量
 - 总结旧文本上下文
 - 删除普通文字对话
-- 修改 SQLite 数据库
+- 修改无关 SQLite 数据（仅重算目标线程历史索引的字节偏移）
 - 删除磁盘上的生成图片文件
 - 保证超长纯文本线程一定能塞进模型上下文
 
 如果一个新开的短线程也一直 reconnect，那更像网络/代理/WebSocket 问题。如果一个纯文本老线程上下文爆了，应该用 `/clear`、`/compact` 或新开 handoff 线程。
 
 ## 使用方式
+
+**执行 `--apply` 前，必须退出使用目标线程的 Codex Desktop、CLI 和 app-server，然后在外部终端运行。清理完成后再打开 Codex。回滚也必须先退出这些进程。**
+
+仅停止生成或切换线程并不保证写入句柄已关闭。在 macOS/Linux 上，替换仍被打开的 rollout 会使后续对话写入旧 inode，退出后这些对话可能丢失。脚本在备份前和替换前通过 `psutil` 检测，返回 `in_use`（发现占用及 PID）、`not_found`（扫描完成且未发现占用）、`unknown`（无法确认）。默认只有 `not_found` 允许继续（显式覆盖见下文）；检测范围明确为当前用户中进程名包含 Codex/ChatGPT 的进程及清理脚本自身（`scope: current_user_codex`）；其他用户及无关进程不在范围内，数量记录在 `out_of_scope_count`。归属无法确认或范围内进程权限不足仍返回 `unknown`。未发现占用不代表排除了 root 或其他用户的访问；请使用运行 Codex 的用户执行。Windows 可能遗漏句柄，因此未发现占用仍返回 `unknown`。检测无法消除最后一次检查后的竞争窗口，因此清理期间必须保持客户端关闭。
+
+若已出现重启后历史丢失，先保留现有 rollout 和备份，不要直接运行旧备份的恢复脚本覆盖当前文件。旧备份只包含清理之前的内容，无法恢复之后未落入目标文件的对话。若进程尚未退出，可检查其仍持有的已删除文件；退出后通常无法再通过文件句柄取回。
 
 只报告，不修改：
 
@@ -183,3 +189,29 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<user>\Documents\Codex\codex-b
 ## 当前版本
 
 **v1.1.0**，更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 清理后重启只显示旧历史
+
+新版本会同步按记录序号重算 `thread_history_1.sqlite` 的字节偏移，并备份该数据库。旧版仅缩短 rollout，可能使分页历史索引停在旧文件末尾，导致后续对话虽已保存却不显示。
+
+修复已受影响的线程：先退出 Codex 和 app-server，从外部终端执行（不重新清理图片）：
+
+```bash
+python3 scripts/imageclean.py --thread <线程ID> --repair-history-index --apply
+```
+
+此命令备份历史数据库，只重算目标线程的字节偏移，不删除对话或修改 rollout。所有使用该历史数据库的客户端必须保持关闭。恢复旧 rollout 后，也需要再次执行索引修复以匹配其字节位置。
+
+## Python 依赖
+
+使用 `uv run scripts/imageclean.py ...` 会自动安装脚本声明的 `psutil` 依赖。直接使用 Python 时先执行 `python3 -m pip install -r requirements.txt`。检测只是快照，不能阻止检查后其他进程重新打开文件。
+
+## 显式强制替换
+
+`--apply --force-replace` 会绕过 rollout 和历史数据库的 `in_use`、`unknown` 占用检测拦截，也适用于 `--repair-history-index`。每次绕过会向标准错误输出警告，结果记录 `force_replace: true`。备份、线程身份、JSON/检查点校验及 rollout 并发修改检测仍生效；系统权限和 SQLite 锁错误不会被绕过。请保持客户端关闭：强制替换仍被写入的文件可能导致后续对话丢失。
+
+```bash
+uv run scripts/imageclean.py --thread <线程ID> --apply --force-replace
+```
+
+检测按进程名包含 `codex` 或 `chatgpt`（不区分大小写）以及脚本自身 PID 筛选；僵尸进程已释放句柄，直接跳过。改名的写入进程、其他应用及其他用户不在这个启发式范围内，未发现占用并非全系统保证。

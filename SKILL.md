@@ -23,10 +23,11 @@ Read `README.md` for user-facing documentation and `README.zh-CN.md` for the Chi
 
 - Default to report-only. Do not mutate a rollout unless the user explicitly asks to clean/apply.
 - Only touch the exact thread/session requested by the user.
+- After shrinking a rollout, rebase the target thread history index byte offsets from unchanged record ordinals. Back up the history database first and require all clients of that database to be stopped. For already cleaned threads use `--repair-history-index --apply`; do not restore an old rollout over newer history.
 - Treat `~/.codex` and `%USERPROFILE%` as protected paths.
 - Back up the rollout before applying changes.
 - Never delete the original backup.
-- Do not truncate event history, reorder lines, edit SQLite records, or rewrite any `type: "compacted"` line.
+- Do not truncate event history, reorder lines, edit unrelated SQLite records, or rewrite any `type: "compacted"` line.
 - Treat compacted lines as opaque hydration checkpoints. Copy them byte-for-byte and verify their ordered SHA-256 hashes before replacing the rollout.
 - Prefer removing image payloads over replacing them with tiny image data URLs; tiny images can still trigger model-side image validation errors.
 - Remove actual active payloads structurally. Do not replace ordinary text merely because it mentions `input_image` or `image_url`.
@@ -44,7 +45,7 @@ Read `README.md` for user-facing documentation and `README.zh-CN.md` for the Chi
 python scripts/imageclean.py --thread 019e356a-cf17-7b11-aab5-88e6e3988a51
 ```
 
-3. If the user asked to apply, run:
+3. Before apply, have the user quit Codex Desktop and stop CLI/app-server processes using this thread. Run from an external terminal; keep clients stopped until cleanup finishes. An idle thread may still hold a writer. Apply requires psutil and normally proceeds only when inspection returns `not_found`; an explicitly requested `--force-replace` overrides file-usage checks with warnings, while backups and integrity/concurrent-change checks remain enforced; `in_use` reports holder PIDs and `unknown` blocks changes. Inspection scope is current_user_codex: count other-user and unrelated processes as out of scope; unknown owners and inaccessible current-user Codex/ChatGPT processes and the cleaner itself remain unknown. This does not rule out root or another user accessing the file. Run as the Codex user. Windows negative scans are `unknown` because enumeration may omit handles. If the user asked to apply, run:
 
 ```powershell
 python scripts/imageclean.py --thread 019e356a-cf17-7b11-aab5-88e6e3988a51 --apply
@@ -62,7 +63,7 @@ python scripts/imageclean.py --thread 019e356a-cf17-7b11-aab5-88e6e3988a51 --app
    - number and bytes of compacted lines preserved
    - compacted-line hash verification
 
-5. Ask the user to restart Codex App and test the repaired thread if the App had the thread open.
+5. Reopen Codex App and test continuation, then restart and verify the new conversation persists.
 
 ## What Apply Does
 
@@ -88,7 +89,7 @@ If a cleaned thread works before restart but fails after restart with `context_w
 
 ## Restore
 
-Run the generated restore script from the backup directory:
+Quit clients using the thread before restoring. Preserve the current rollout separately: restore overwrites newer history. Run the generated restore script from the backup directory:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\Users\Administrator\Documents\Codex\codex-backups\<backup>\restore.ps1
@@ -99,3 +100,5 @@ powershell -ExecutionPolicy Bypass -File C:\Users\Administrator\Documents\Codex\
 - Do not use this for ordinary local log rotation.
 - Do not use this to archive sessions; use a session maintenance workflow instead.
 - Do not use this if the user needs the old thread's visual image content inside chat history. In that case, create a handoff and continue in a fresh thread.
+
+Occupancy scope uses process names containing `codex` or `chatgpt` (case-insensitive), plus the cleaner PID; zombies are skipped because they have released descriptors. Renamed writers, other applications, and other users are outside this heuristic scope. A negative result is not a system-wide guarantee.

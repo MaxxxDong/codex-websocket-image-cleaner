@@ -98,7 +98,7 @@ It does not:
 - configure VPN, DNS, TUN mode, or proxy environment variables
 - summarize old text conversation history
 - delete normal text messages
-- edit SQLite databases
+- edit unrelated SQLite data (only the target thread history byte offsets are rebased)
 - remove generated image files from disk
 - guarantee that a very long text-only thread fits the model context window
 
@@ -248,3 +248,37 @@ Planned improvements:
 - size threshold warnings
 - stale `.tmp-imageclean-*` cleanup
 - optional HTML/Markdown cleanup report
+
+## Close clients before applying or restoring
+
+Before `--apply` or restore, quit Codex Desktop and stop any CLI/app-server using the target thread. Run the cleaner from an external terminal and reopen Codex only after it finishes. An idle thread can still have an open writer.
+
+On macOS/Linux, replacing an open rollout leaves its writer attached to the old inode. Later conversations can disappear after exit. The cleaner checks open files with `psutil` before backup and replacement. It returns `in_use` (holder PIDs found), `not_found` (scan completed without finding a holder), or `unknown` (incomplete inspection). Apply normally proceeds only for `not_found` (see the explicit override below). The scope is explicitly `current_user_codex`: processes with a different owner are outside scope and counted in `out_of_scope_count`. Unknown ownership or denied access to an in-scope process returns `unknown`. A negative result does not rule out access by another user or root. Run as the user running Codex. Windows negative scans remain `unknown` because psutil may omit handles. These checks are best effort; keep clients stopped throughout cleanup to avoid a race after the final check.
+
+If history has already disappeared, preserve the current rollout and backups before recovery. Restoring the original backup overwrites newer history and cannot recover conversations written only to an unlinked inode. Recovery through an open handle may be possible while the original writer is still alive; after it exits that route is unavailable.
+
+## Repair stale paginated history after older cleanups
+
+Cleanup now rebases the target thread's cached byte offsets in `thread_history_1.sqlite`, with a database backup. Older cleanups could leave the cursor beyond EOF, hiding later conversations that remain in the rollout.
+
+Quit all Codex clients and app-server processes, then run from an external terminal:
+
+```bash
+python3 scripts/imageclean.py --thread <thread-id> --repair-history-index --apply
+```
+
+This repairs offsets using unchanged record ordinals without rewriting the rollout or deleting items. Keep every client of the history database stopped. After restoring an older rollout, rerun this repair to match its offsets.
+
+## Python dependency
+
+`uv run scripts/imageclean.py ...` installs the inline `psutil` dependency automatically. For direct Python use, run `python3 -m pip install -r requirements.txt` first. Run tests with `uv run --with psutil python -m unittest discover -s tests -v`. The scan is a snapshot and does not prevent another process from opening the file afterward.
+
+## Explicit override
+
+`--apply --force-replace` overrides both `in_use` and `unknown` file-usage results for the rollout and history database, including `--repair-history-index`. Warnings are printed to stderr and the result records `force_replace: true`. Backups, thread identity checks, JSON/checkpoint validation, and concurrent rollout modification checks still apply. It does not bypass OS permissions or SQLite locking errors. Keep clients stopped: forcing replacement of a live file can lose later conversations.
+
+```bash
+uv run scripts/imageclean.py --thread <thread-id> --apply --force-replace
+```
+
+Occupancy scope uses process names containing `codex` or `chatgpt` (case-insensitive), plus the cleaner PID; zombies are skipped because they have released descriptors. Renamed writers, other applications, and other users are outside this heuristic scope. A negative result is not a system-wide guarantee.
