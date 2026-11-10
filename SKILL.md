@@ -45,7 +45,7 @@ Read `README.md` for user-facing documentation and `README.zh-CN.md` for the Chi
 python scripts/imageclean.py --thread 019e356a-cf17-7b11-aab5-88e6e3988a51
 ```
 
-3. Before apply, have the user quit Codex Desktop and stop CLI/app-server processes using this thread. Run from an external terminal; keep clients stopped until cleanup finishes. An idle thread may still hold a writer. POSIX apply requires lsof and refuses open files or failed inspection. If the user asked to apply, run:
+3. Before apply, have the user quit Codex Desktop and stop CLI/app-server processes using this thread. Run from an external terminal; keep clients stopped until cleanup finishes. An idle thread may still hold a writer. Apply requires psutil and normally proceeds only when inspection returns `not_found`; an explicitly requested `--force-replace` overrides file-usage checks with warnings, while backups and integrity/concurrent-change checks remain enforced; `in_use` reports holder PIDs and `unknown` blocks changes. Inspection scope is current_user_codex: count other-user and unrelated processes as out of scope; unknown owners and inaccessible current-user Codex/ChatGPT processes and the cleaner itself remain unknown. This does not rule out root or another user accessing the file. Run as the Codex user. Windows negative scans are `unknown` because enumeration may omit handles. If the user asked to apply, run:
 
 ```powershell
 python scripts/imageclean.py --thread 019e356a-cf17-7b11-aab5-88e6e3988a51 --apply
@@ -100,3 +100,5 @@ powershell -ExecutionPolicy Bypass -File C:\Users\Administrator\Documents\Codex\
 - Do not use this for ordinary local log rotation.
 - Do not use this to archive sessions; use a session maintenance workflow instead.
 - Do not use this if the user needs the old thread's visual image content inside chat history. In that case, create a handoff and continue in a fresh thread.
+
+Occupancy scope uses process names containing `codex` or `chatgpt` (case-insensitive), plus the cleaner PID; zombies are skipped because they have released descriptors. Renamed writers, other applications, and other users are outside this heuristic scope. A negative result is not a system-wide guarantee.

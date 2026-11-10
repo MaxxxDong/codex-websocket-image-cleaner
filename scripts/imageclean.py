@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["psutil>=5.9"]
+# ///
 """Report or remove embedded image payloads from a Codex rollout JSONL file."""
 
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import datetime as dt
 import hashlib
 import json
@@ -13,7 +18,9 @@ import re
 import shlex
 import shutil
 import sqlite3
-import subprocess
+import sys
+
+import psutil
 from typing import Any
 
 
@@ -245,79 +252,88 @@ def write_restore_scripts(backup_dir: Path, backup_path: Path, target: Path) -> 
     return restore_ps1, restore_sh
 
 
-def lsof_exclusions(path: Path, stderr: str) -> list[str]:
-    """Classify only mount-stat warnings proven unrelated by Linux mountinfo.
+def inspect_file_usage(path: Path) -> dict[str, Any]:
+    """Return in_use, not_found, or unknown; a snapshot, never a lock.
 
-    Never ignore arbitrary warnings. Device comparison also protects bind mounts
-    and aliases of the target filesystem, beyond a simple path-prefix check.
-    Unknown mounts, unavailable mountinfo, and mixed diagnostics fail closed.
+    Scan current-user Codex/ChatGPT processes and this process only.
+    Unknown ownership or permission failures within scope make the result unknown.
+    A known holder takes precedence.
+    Windows open_files may silently omit handles, so a negative is unknown.
     """
-    pattern = re.compile(
-        r"lsof: WARNING: can't stat\(\) [^\n]+ file system (/[^\n]+)\n"
-        r"      Output information may be incomplete\.\n?"
-    )
-    warnings = list(pattern.finditer(stderr))
-    if not warnings or pattern.sub("", stderr).strip():
-        return []
+    pids: set[int] = set()
+    errors: list[str] = []
+    out_of_scope = 0
     try:
         target = path.resolve(strict=True)
-        device = target.stat().st_dev
-        target_device = f"{os.major(device)}:{os.minor(device)}"
-        mount_devices: dict[str, set[str]] = {}
-        for line in Path("/proc/self/mountinfo").read_text().splitlines():
-            fields = line.split()
-            mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
-            mount_devices.setdefault(mount, set()).add(fields[2])
-        exclusions = []
-        for warning in warnings:
-            mount = warning[1]
-            devices = mount_devices.get(mount)
-            if not devices or target_device in devices or target.is_relative_to(Path(mount)):
-                return []
-            if mount not in exclusions:
-                exclusions.append(mount)
-        return exclusions
-    except (OSError, ValueError, IndexError):
-        return []
+        stat = target.stat()
+        identity = (stat.st_dev, stat.st_ino)
+        uid = os.geteuid() if sys.platform != "win32" else None
+        username = psutil.Process().username() if uid is None else None
+        for process in psutil.process_iter():
+            try:
+                same_user = uid in process.uids() if uid is not None else process.username() == username
+                if not same_user:
+                    out_of_scope += 1
+                    continue
+                if process.status() == psutil.STATUS_ZOMBIE:
+                    # Zombies have exited and released their file descriptors.
+                    continue
+                name = process.name().casefold()
+                if process.pid != os.getpid() and not any(token in name for token in ("codex", "chatgpt")):
+                    out_of_scope += 1
+                    continue
+                files = process.open_files()
+            except psutil.ZombieProcess:
+                errors.append(f"PID {process.pid}: ZombieProcess")
+                continue
+            except psutil.NoSuchProcess:
+                # A process which exited cannot retain an open handle.
+                continue
+            except (psutil.Error, OSError) as exc:
+                errors.append(f"PID {process.pid}: {type(exc).__name__}")
+                continue
+            for file in files:
+                try:
+                    # stat follows aliases/hardlinks; don't rely on path equality.
+                    if os.path.normcase(os.path.abspath(file.path)) == os.path.normcase(str(target)):
+                        pids.add(process.pid)
+                        continue
+                    opened = os.stat(file.path)
+                    if (opened.st_dev, opened.st_ino) == identity:
+                        pids.add(process.pid)
+                except FileNotFoundError:
+                    # This other pathname has disappeared since enumeration.
+                    continue
+                except OSError as exc:
+                    errors.append(f"PID {process.pid}: {type(exc).__name__}")
+        if sys.platform == "win32":
+            errors.append("Windows open_files() may omit file handles")
+    except (psutil.Error, OSError) as exc:
+        errors.append(type(exc).__name__)
+    status = "in_use" if pids else "unknown" if errors else "not_found"
+    return {"status": status, "pids": sorted(pids), "errors": errors,
+            "scope": "current_user_codex", "out_of_scope_count": out_of_scope}
 
 
-def assert_rollout_closed(path: Path) -> None:
-    """Reject live POSIX files: rename would orphan an existing writer's inode.
-
-    This is a best-effort check, not a lock respected by Codex. Keep all clients
-    using this thread stopped throughout cleanup, including the final rename.
-    Windows rejects replacing a file held by the normal Codex writer itself.
-    """
-    if os.name == "nt":
+def assert_rollout_closed(path: Path, *, force_replace: bool = False) -> None:
+    result = inspect_file_usage(path)
+    if force_replace and result["status"] != "not_found":
+        print(
+            f"WARNING: --force-replace bypasses {result['status']} file-usage check for {path}; "
+            f"PIDs: {result['pids']}; errors: {result['errors'][:8]}. "
+            "Live writers may lose subsequent conversations; concurrent database access may invalidate history repair.",
+            file=sys.stderr,
+        )
         return
-    lsof = shutil.which("lsof")
-    if not lsof:
-        raise SystemExit("Cannot verify rollout is closed: install lsof before --apply.")
-    try:
-        result = subprocess.run(
-            [lsof, "-nP", "-F", "p", "--", str(path.resolve())],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 1 and not result.stdout.strip() and result.stderr:
-            exclusions = lsof_exclusions(path, result.stderr)
-            if exclusions:
-                args = [lsof, "-nP"]
-                for mount in exclusions:
-                    args.extend(["-e", mount])
-                result = subprocess.run(
-                    args + ["-F", "p", "--", str(path.resolve())],
-                    capture_output=True, text=True, timeout=15,
-                )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SystemExit("Cannot verify rollout is closed; target was not replaced.") from exc
-    if result.stdout.strip():
+    if result["status"] == "in_use":
         raise SystemExit(
-            "Rollout is open by a process. Close Codex App and any CLI/app-server "
-            "using this thread, then run --apply from an external terminal. "
-            "Replacing an open rollout can lose future conversations after restart."
+            f"File is open by a process (PIDs: {result['pids']}). Close Codex App "
+            "and any CLI/app-server using this thread, then run from an external "
+            "terminal. Replacing an open rollout can lose future conversations after restart."
         )
-    if result.returncode != 1 or result.stderr.strip():
-        raise SystemExit("Cannot verify rollout is closed (lsof failed); target was not replaced.")
+    if result["status"] != "not_found":
+        details = "; ".join(result["errors"][:8])
+        raise SystemExit(f"Cannot verify file is closed for current-user Codex processes (unknown): {path}: {details}")
 
 
 def validate_thread_identity(path: Path, thread_id: str | None) -> str | None:
@@ -331,7 +347,7 @@ def validate_thread_identity(path: Path, thread_id: str | None) -> str | None:
     return requested_id or recorded_id
 
 
-def repair_history_index(path: Path, db: Path, thread_id: str, backup_root: Path) -> dict[str, Any]:
+def repair_history_index(path: Path, db: Path, thread_id: str, backup_root: Path, *, force_replace: bool = False) -> dict[str, Any]:
     """Rebase cached byte offsets using unchanged zero-based rollout ordinals.
 
     The end ordinal is inclusive; the projection cursor is the next ordinal.
@@ -339,8 +355,8 @@ def repair_history_index(path: Path, db: Path, thread_id: str, backup_root: Path
     """
     if not db.exists():
         raise SystemExit(f"History DB not found: {db}")
-    assert_rollout_closed(path)
-    assert_rollout_closed(db)
+    assert_rollout_closed(path, force_replace=force_replace)
+    assert_rollout_closed(db, force_replace=force_replace)
     validate_thread_identity(path, thread_id)
     offsets = [0]
     with path.open("rb") as source:
@@ -369,9 +385,9 @@ def repair_history_index(path: Path, db: Path, thread_id: str, backup_root: Path
         backup_dir = backup_root / ("history-index-repair-" + dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
         backup_dir.mkdir(parents=True, exist_ok=False)
         backup = backup_dir / db.name
-        with sqlite3.connect(str(backup)) as dest:
+        with closing(sqlite3.connect(str(backup))) as dest:
             con.backup(dest)
-        # Clients must remain stopped throughout; the lsof check is not a lock.
+        # Clients must remain stopped throughout; file-usage inspection is not a lock.
         with con:
             con.executemany(
                 "UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=? WHERE rowid=?", updates
@@ -383,15 +399,15 @@ def repair_history_index(path: Path, db: Path, thread_id: str, backup_root: Path
                 )
     finally:
         con.close()
-    return {"thread_id": thread_id, "history_backup": str(backup),
+    return {"force_replace": force_replace, "thread_id": thread_id, "history_backup": str(backup),
             "turns_rebased": len(updates), "next_rollout_byte_offset": next_offset}
 
 
-def clean_rollout(path: Path, backup_root: Path, thread_id: str | None, history_db: Path | None = None) -> dict[str, Any]:
+def clean_rollout(path: Path, backup_root: Path, thread_id: str | None, history_db: Path | None = None, *, force_replace: bool = False) -> dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"Rollout not found: {path}")
 
-    assert_rollout_closed(path)
+    assert_rollout_closed(path, force_replace=force_replace)
     indexed_thread = validate_thread_identity(path, thread_id)
     history_db = history_db if history_db is not None else codex_home() / "thread_history_1.sqlite"
     repair_needed = False
@@ -404,7 +420,7 @@ def clean_rollout(path: Path, backup_root: Path, thread_id: str | None, history_
         finally:
             con.close()
         if repair_needed:
-            assert_rollout_closed(history_db)
+            assert_rollout_closed(history_db, force_replace=force_replace)
     source_stat = path.stat()
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     slug = thread_id[:8] if thread_id else path.stem[-8:]
@@ -431,7 +447,7 @@ def clean_rollout(path: Path, backup_root: Path, thread_id: str | None, history_
                 output.write(json.dumps(cleaned, ensure_ascii=False, separators=(",", ":")) + line_ending(line))
 
         checked = validate_rollout(tmp, compacted_hashes)
-        assert_rollout_closed(path)
+        assert_rollout_closed(path, force_replace=force_replace)
         current_stat = path.stat()
         if (current_stat.st_dev, current_stat.st_ino, current_stat.st_size, current_stat.st_mtime_ns) != (source_stat.st_dev, source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns):
             raise SystemExit("Rollout changed during cleanup; target was not replaced.")
@@ -445,13 +461,13 @@ def clean_rollout(path: Path, backup_root: Path, thread_id: str | None, history_
     restore_ps1, restore_sh = write_restore_scripts(backup_dir, backup_path, path)
     try:
         history_repair = (
-            repair_history_index(path, history_db, indexed_thread, backup_dir)
+            repair_history_index(path, history_db, indexed_thread, backup_dir, force_replace=force_replace)
             if repair_needed else None
         )
     except (Exception, SystemExit):
         # Index repair validates before updating and uses a SQLite transaction.
         # Restore the matching rollout if it cannot complete.
-        assert_rollout_closed(path)
+        assert_rollout_closed(path, force_replace=force_replace)
         try:
             shutil.copy2(backup_path, tmp)
             os.replace(tmp, path)
@@ -459,6 +475,7 @@ def clean_rollout(path: Path, backup_root: Path, thread_id: str | None, history_
             tmp.unlink(missing_ok=True)
         raise
     manifest = {
+        "force_replace": force_replace,
         "history_index_repair": history_repair,
         "thread_id": thread_id,
         "target": str(path),
@@ -487,7 +504,10 @@ def main() -> int:
     parser.add_argument("--repair-history-index", action="store_true", help="Offline repair of cached history byte offsets; requires --thread and --apply.")
     parser.add_argument("--history-db", help="Override thread_history_1.sqlite path")
     parser.add_argument("--apply", action="store_true", help="Apply cleanup. Without this flag, report only.")
+    parser.add_argument("--force-replace", action="store_true", help="With --apply, bypass in_use/unknown file-usage checks. Live writers may lose subsequent conversations.")
     args = parser.parse_args()
+    if args.force_replace and not args.apply:
+        parser.error("--force-replace requires --apply")
 
     thread_id, rollout_path = resolve_rollout(args.thread, args.path, args.state_db)
     rollout_path = rollout_path.expanduser()
@@ -498,12 +518,12 @@ def main() -> int:
             raise SystemExit("--repair-history-index requires --thread and --apply.")
         result = repair_history_index(
             rollout_path, Path(args.history_db).expanduser() if args.history_db else codex_home() / "thread_history_1.sqlite",
-            parse_thread_id(thread_id), Path(args.backup_root).expanduser(),
+            parse_thread_id(thread_id), Path(args.backup_root).expanduser(), force_replace=args.force_replace,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     result = (
-        {"mode": "apply", "thread_id": thread_id, "result": clean_rollout(rollout_path, Path(args.backup_root).expanduser(), thread_id, Path(args.history_db).expanduser() if args.history_db else None)}
+        {"mode": "apply", "thread_id": thread_id, "result": clean_rollout(rollout_path, Path(args.backup_root).expanduser(), thread_id, Path(args.history_db).expanduser() if args.history_db else None, force_replace=args.force_replace)}
         if args.apply
         else {"mode": "report", "thread_id": thread_id, "report": analyze_rollout(rollout_path)}
     )
