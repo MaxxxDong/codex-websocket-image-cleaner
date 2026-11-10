@@ -245,6 +245,42 @@ def write_restore_scripts(backup_dir: Path, backup_path: Path, target: Path) -> 
     return restore_ps1, restore_sh
 
 
+def lsof_exclusions(path: Path, stderr: str) -> list[str]:
+    """Classify only mount-stat warnings proven unrelated by Linux mountinfo.
+
+    Never ignore arbitrary warnings. Device comparison also protects bind mounts
+    and aliases of the target filesystem, beyond a simple path-prefix check.
+    Unknown mounts, unavailable mountinfo, and mixed diagnostics fail closed.
+    """
+    pattern = re.compile(
+        r"lsof: WARNING: can't stat\(\) [^\n]+ file system (/[^\n]+)\n"
+        r"      Output information may be incomplete\.\n?"
+    )
+    warnings = list(pattern.finditer(stderr))
+    if not warnings or pattern.sub("", stderr).strip():
+        return []
+    try:
+        target = path.resolve(strict=True)
+        device = target.stat().st_dev
+        target_device = f"{os.major(device)}:{os.minor(device)}"
+        mount_devices: dict[str, set[str]] = {}
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            fields = line.split()
+            mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4])
+            mount_devices.setdefault(mount, set()).add(fields[2])
+        exclusions = []
+        for warning in warnings:
+            mount = warning[1]
+            devices = mount_devices.get(mount)
+            if not devices or target_device in devices or target.is_relative_to(Path(mount)):
+                return []
+            if mount not in exclusions:
+                exclusions.append(mount)
+        return exclusions
+    except (OSError, ValueError, IndexError):
+        return []
+
+
 def assert_rollout_closed(path: Path) -> None:
     """Reject live POSIX files: rename would orphan an existing writer's inode.
 
@@ -262,6 +298,16 @@ def assert_rollout_closed(path: Path) -> None:
             [lsof, "-nP", "-F", "p", "--", str(path.resolve())],
             capture_output=True, text=True, timeout=15,
         )
+        if result.returncode == 1 and not result.stdout.strip() and result.stderr:
+            exclusions = lsof_exclusions(path, result.stderr)
+            if exclusions:
+                args = [lsof, "-nP"]
+                for mount in exclusions:
+                    args.extend(["-e", mount])
+                result = subprocess.run(
+                    args + ["-F", "p", "--", str(path.resolve())],
+                    capture_output=True, text=True, timeout=15,
+                )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SystemExit("Cannot verify rollout is closed; target was not replaced.") from exc
     if result.stdout.strip():

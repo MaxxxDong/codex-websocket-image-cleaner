@@ -15,6 +15,37 @@ SPEC.loader.exec_module(imageclean)
 
 
 class ImageCleanTests(unittest.TestCase):
+    def test_unrelated_mount_warnings_are_classified_by_device(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "rollout"
+            target.touch()
+            device = f"{os.major(target.stat().st_dev)}:{os.minor(target.stat().st_dev)}"
+            mounts = "1 0 999:998 / /run/user/120/gvfs rw - fuse.gvfsd-fuse gvfs rw\n"
+            mounts += f"2 0 {device} / /same-device rw - ext4 source rw\n"
+            warning = "lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/120/gvfs\n      Output information may be incomplete.\n"
+            with mock.patch.object(Path, "read_text", return_value=mounts):
+                self.assertEqual(imageclean.lsof_exclusions(target, warning), ["/run/user/120/gvfs"])
+                self.assertEqual(imageclean.lsof_exclusions(target, warning + "other warning\n"), [])
+                self.assertEqual(imageclean.lsof_exclusions(target, warning.replace("/run/user/120/gvfs", "/same-device")), [])
+                self.assertEqual(imageclean.lsof_exclusions(target, warning.replace("/run/user/120/gvfs", "/unknown")), [])
+                second = warning.replace("/run/user/120/gvfs", "/tmp/remote share")
+                with mock.patch.object(Path, "read_text", return_value=mounts + "3 0 999:997 / /tmp/remote\\040share rw - nfs remote rw\n"):
+                    self.assertEqual(imageclean.lsof_exclusions(target, warning + second), ["/run/user/120/gvfs", "/tmp/remote share"])
+            with mock.patch.object(Path, "read_text", side_effect=PermissionError):
+                self.assertEqual(imageclean.lsof_exclusions(target, warning), [])
+
+    def test_lsof_mount_retry_preserves_error_guards(self):
+        result = imageclean.subprocess.CompletedProcess
+        for retry, error in [(result([], 1, "", ""), None), (result([], 0, "p123\n", ""), "open"), (result([], 1, "", "other warning"), "lsof failed"), (result([], 2, "", ""), "lsof failed")]:
+            with self.subTest(retry=retry), mock.patch.object(imageclean.shutil, "which", return_value="lsof"), mock.patch.object(imageclean, "lsof_exclusions", return_value=["/unrelated"]), mock.patch.object(imageclean.subprocess, "run", side_effect=[result([], 1, "", "warning"), retry]) as run:
+                if error:
+                    with self.assertRaisesRegex(SystemExit, error):
+                        imageclean.assert_rollout_closed(Path("/target"))
+                else:
+                    imageclean.assert_rollout_closed(Path("/target"))
+                self.assertIn("/unrelated", run.call_args.args[0])
+                self.assertEqual(run.call_count, 2)
+
     @unittest.skipIf(os.name == "nt", "POSIX open-inode regression")
     def test_apply_refuses_open_rollout_and_preserves_future_appends(self):
         with tempfile.TemporaryDirectory() as directory:
