@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Load psutil lazily: report mode and `--help` run on the standard library alone; apply and history repair stop with an install hint (even with `--force-replace`) when psutil is missing.
+
 - Scope psutil inspection to current-user Codex/ChatGPT processes and the cleaner itself; skip exited zombies; report scope and excluded process count, while preserving unknown for unidentified owners and inaccessible in-scope processes.
 
 - Add explicit `--apply --force-replace` override for in_use/unknown occupancy checks, retaining backup and integrity checks and recording the override in results.

@@ -92,6 +92,19 @@ class ImageCleanTests(unittest.TestCase):
                     imageclean.clean_rollout(path, root / "backups", None, root / "absent.sqlite", force_replace=True)
             self.assertIn('"new"', path.read_text())
 
+    def test_missing_psutil_allows_report_but_blocks_apply_even_when_forced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "rollout.jsonl"
+            original = '{"type":"event_msg","payload":"data:image/png;base64,AAAA"}\n'
+            path.write_text(original)
+            with mock.patch.object(imageclean, "psutil", None):
+                self.assertTrue(imageclean.analyze_rollout(path))
+                with self.assertRaisesRegex(SystemExit, "requires psutil"):
+                    imageclean.clean_rollout(path, root / "backups", None, root / "absent.sqlite", force_replace=True)
+            self.assertEqual(path.read_text(), original)
+            self.assertFalse((root / "backups").exists())
+
     @unittest.skipIf(os.name == "nt", "POSIX UID scope")
     def test_other_users_are_outside_scope_but_unknown_owners_block(self):
         with tempfile.NamedTemporaryFile() as file:
