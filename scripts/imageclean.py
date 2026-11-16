@@ -19,9 +19,12 @@ import shlex
 import shutil
 import sqlite3
 import sys
-
-import psutil
 from typing import Any
+
+try:
+    import psutil
+except ImportError:  # Report mode needs only the standard library; apply/repair require psutil.
+    psutil = None
 
 
 IMAGE_MARKERS = ("data:image/", "input_image", "image_url")
@@ -260,6 +263,11 @@ def inspect_file_usage(path: Path) -> dict[str, Any]:
     A known holder takes precedence.
     Windows open_files may silently omit handles, so a negative is unknown.
     """
+    if psutil is None:
+        raise SystemExit(
+            "File-usage inspection requires psutil; nothing was changed. Run with "
+            "`uv run scripts/imageclean.py ...` or install it via `python3 -m pip install -r requirements.txt`."
+        )
     pids: set[int] = set()
     errors: list[str] = []
     out_of_scope = 0
